@@ -1,18 +1,54 @@
 """
-MedQuery AI — Day 5 & 6: Streamlit Chat UI
-============================================
-What this does:
-  - Full chat interface for your RAG pipeline
-  - Shows source citations, confidence score, relevancy %
-  - PDF upload support (bonus feature!)
-  - Medical disclaimer on every response
+MedQuery AI — Streamlit Cloud Version
+=======================================
+Key differences from local version:
+  - API key read from st.secrets (Streamlit Cloud secrets panel)
+  - ChromaDB rebuilt on startup from pubmed_raw.json (committed to repo)
+  - chroma_db/ folder lives in /tmp (writable on cloud)
 
-Run: streamlit run app.py
+Deploy steps:
+  1. Push this file + requirements.txt + pubmed_raw.json to GitHub
+  2. Go to share.streamlit.io → New app → connect repo
+  3. Add GROQ_API_KEY in App Settings → Secrets
 """
 
+import os
+import json
 import streamlit as st
-import time
-from day3_retrieval import MedQueryRAG
+from sentence_transformers import SentenceTransformer
+import chromadb
+from groq import Groq
+
+# ============================================================
+# CONFIG
+# ============================================================
+COLLECTION_NAME  = "medquery_pubmed"
+EMBEDDING_MODEL  = "pritamdeka/BioBERT-mnli-snli-scinli-scitail-mednli-stsb"
+LLM_MODEL        = "llama-3.3-70b-versatile"
+TOP_K_RESULTS    = 5
+CHROMA_DB_PATH   = "/tmp/chroma_db"  # writable on Streamlit Cloud
+
+SYSTEM_PROMPT = """You are MedQuery AI, a clinical research assistant that answers
+medical questions based strictly on peer-reviewed PubMed literature.
+
+STRICT RULES:
+1. Answer ONLY using the provided context from PubMed abstracts
+2. If context is insufficient say: "The provided literature does not sufficiently address this."
+3. Always cite sources using [PMID: XXXXXXX] inline
+4. Include a confidence level: HIGH / MEDIUM / LOW
+
+FORMAT:
+**Answer:** [evidence-based answer with inline citations]
+
+**Key Evidence:**
+- [bullet points of key findings]
+
+**Confidence:** [HIGH/MEDIUM/LOW] — [reason]
+
+**Sources:**
+- [PMID: XXXXX] Title | Authors (Year)
+
+⚠️ Disclaimer: For informational purposes only. Not medical advice."""
 
 # ============================================================
 # PAGE CONFIG
@@ -24,53 +60,139 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# ============================================================
-# CUSTOM CSS
-# ============================================================
 st.markdown("""
 <style>
-    .main-header {
-        background: linear-gradient(135deg, #1a5276, #2e86c1);
-        padding: 1.5rem 2rem;
-        border-radius: 12px;
-        color: white;
-        margin-bottom: 1.5rem;
-    }
-    .confidence-high   { background:#d5f5e3; color:#1e8449; padding:4px 12px; border-radius:20px; font-size:13px; font-weight:600; }
-    .confidence-medium { background:#fef9e7; color:#b7950b; padding:4px 12px; border-radius:20px; font-size:13px; font-weight:600; }
-    .confidence-low    { background:#fadbd8; color:#922b21; padding:4px 12px; border-radius:20px; font-size:13px; font-weight:600; }
-    .source-card {
-        background: #f8f9fa;
-        border-left: 4px solid #2e86c1;
-        padding: 10px 14px;
-        border-radius: 6px;
-        margin: 6px 0;
-        font-size: 13px;
-    }
-    .disclaimer {
-        background: #fef9e7;
-        border: 1px solid #f9e79f;
-        padding: 10px 14px;
-        border-radius: 8px;
-        font-size: 12px;
-        color: #7d6608;
-        margin-top: 10px;
-    }
-    .metric-box {
-        background: #eaf4fb;
-        border-radius: 8px;
-        padding: 10px;
-        text-align: center;
-    }
+.main-header{background:linear-gradient(135deg,#1a5276,#2e86c1);padding:1.5rem 2rem;border-radius:12px;color:white;margin-bottom:1.5rem;}
+.confidence-high{background:#d5f5e3;color:#1e8449;padding:4px 12px;border-radius:20px;font-size:13px;font-weight:600;}
+.confidence-medium{background:#fef9e7;color:#b7950b;padding:4px 12px;border-radius:20px;font-size:13px;font-weight:600;}
+.confidence-low{background:#fadbd8;color:#922b21;padding:4px 12px;border-radius:20px;font-size:13px;font-weight:600;}
+.source-card{background:#f8f9fa;border-left:4px solid #2e86c1;padding:10px 14px;border-radius:6px;margin:6px 0;font-size:13px;}
+.disclaimer{background:#fef9e7;border:1px solid #f9e79f;padding:10px 14px;border-radius:8px;font-size:12px;color:#7d6608;margin-top:10px;}
 </style>
 """, unsafe_allow_html=True)
 
 # ============================================================
-# INITIALIZE RAG (cached so it loads only once)
+# GET GROQ KEY — works both locally and on Streamlit Cloud
 # ============================================================
-@st.cache_resource
-def load_rag():
-    return MedQueryRAG()
+def get_groq_key():
+    # Streamlit Cloud: reads from secrets panel
+    try:
+        return st.secrets["GROQ_API_KEY"]
+    except Exception:
+        pass
+    # Local fallback: reads from environment / .env
+    key = os.environ.get("GROQ_API_KEY", "")
+    if not key:
+        st.error("❌ GROQ_API_KEY not found. Add it in App Settings → Secrets on Streamlit Cloud.")
+        st.stop()
+    return key
+
+# ============================================================
+# BUILD RAG PIPELINE — cached, runs once per session
+# ============================================================
+@st.cache_resource(show_spinner=False)
+def load_pipeline():
+    groq_key = get_groq_key()
+
+    # 1. Load BioBERT
+    with st.spinner("🧬 Loading BioBERT embeddings..."):
+        model = SentenceTransformer(EMBEDDING_MODEL)
+
+    # 2. Build ChromaDB from pubmed_raw.json
+    with st.spinner("🗄️ Building vector store from PubMed data..."):
+        client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
+        try:
+            client.delete_collection(COLLECTION_NAME)
+        except Exception:
+            pass
+
+        collection = client.create_collection(
+            name=COLLECTION_NAME,
+            metadata={"hnsw:space": "cosine"}
+        )
+
+        with open("pubmed_raw.json", "r") as f:
+            articles = json.load(f)
+
+        def chunk_text(text, size=400, overlap=50):
+            words = text.split()
+            chunks, step = [], size - overlap
+            for i in range(0, len(words), step):
+                chunk = " ".join(words[i:i + size])
+                if len(chunk.split()) >= 50:
+                    chunks.append(chunk)
+            return chunks
+
+        documents, metadatas, ids = [], [], []
+        for article in articles:
+            full_text = f"Title: {article['title']}\n\nAbstract: {article['abstract']}"
+            for idx, chunk in enumerate(chunk_text(full_text)):
+                documents.append(chunk)
+                metadatas.append({
+                    "pubmed_id":  article["pubmed_id"],
+                    "title":      article["title"],
+                    "authors":    article["authors"],
+                    "year":       article["year"],
+                    "source_url": article["source_url"],
+                })
+                ids.append(f"pmid_{article['pubmed_id']}_chunk_{idx}")
+
+        # Embed in batches of 64
+        for i in range(0, len(documents), 64):
+            batch      = documents[i:i+64]
+            embeddings = model.encode(batch, normalize_embeddings=True).tolist()
+            collection.add(
+                documents  = batch,
+                embeddings = embeddings,
+                metadatas  = metadatas[i:i+64],
+                ids        = ids[i:i+64]
+            )
+
+    # 3. Groq LLM
+    llm = Groq(api_key=groq_key)
+    return model, collection, llm
+
+
+def run_query(question, model, collection, llm):
+    emb = model.encode([question], normalize_embeddings=True).tolist()
+    results = collection.query(
+        query_embeddings=emb,
+        n_results=TOP_K_RESULTS,
+        include=["documents", "metadatas", "distances"]
+    )
+    docs  = results["documents"][0]
+    metas = results["metadatas"][0]
+    dists = results["distances"][0]
+
+    for i, m in enumerate(metas):
+        m["relevancy_score"] = round((1 - dists[i]) * 100, 1)
+
+    context = "\n\n---\n\n".join(
+        f"[Source {i+1}] PMID:{m['pubmed_id']} | {m['title']} | "
+        f"{m['authors']} ({m['year']}) | {m['relevancy_score']}%\n{d}"
+        for i, (d, m) in enumerate(zip(docs, metas))
+    )
+
+    avg  = sum(m["relevancy_score"] for m in metas) / len(metas)
+    dist = len(set(m["pubmed_id"] for m in metas))
+    conf = "HIGH" if avg >= 70 and dist >= 3 else ("MEDIUM" if avg >= 50 else "LOW")
+
+    resp = llm.chat.completions.create(
+        model=LLM_MODEL,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user",   "content": f"QUESTION: {question}\n\nCONTEXT:\n{context}"}
+        ],
+        temperature=0.1,
+        max_tokens=1024,
+    )
+    return {
+        "answer":            resp.choices[0].message.content,
+        "sources":           metas,
+        "confidence":        conf,
+        "avg_relevancy":     round(avg, 1),
+        "chunks_retrieved":  len(docs),
+    }
 
 # ============================================================
 # SIDEBAR
@@ -79,45 +201,33 @@ with st.sidebar:
     st.markdown("## 🩺 MedQuery AI")
     st.markdown("*Clinical Research Assistant*")
     st.divider()
-
-    st.markdown("### About")
-    st.markdown("""
-    Answers medical questions from **10,000+ PubMed abstracts** using:
-    - 🧬 **BioBERT** embeddings
-    - 🗄️ **ChromaDB** vector store
-    - 🤖 **LLaMA-3** via Groq
-    """)
-
-    st.divider()
-    st.markdown("### Settings")
-    top_k = st.slider("Sources to retrieve", min_value=3, max_value=10, value=5)
-    show_raw_chunks = st.checkbox("Show raw retrieved chunks", value=False)
-
+    st.markdown("""Answers medical questions from **10,000+ PubMed abstracts** using:
+- 🧬 **BioBERT** embeddings
+- 🗄️ **ChromaDB** vector store
+- 🤖 **LLaMA-3** via Groq""")
     st.divider()
     st.markdown("### Sample Questions")
-    sample_questions = [
+    for q in [
         "First-line treatment for type 2 diabetes?",
         "Cardiovascular risks of SGLT2 inhibitors?",
         "Metformin vs GLP-1 agonists comparison?",
-        "HbA1c targets in elderly diabetic patients?",
-    ]
-    for q in sample_questions:
+        "HbA1c targets in elderly patients?",
+    ]:
         if st.button(q, use_container_width=True):
-            st.session_state.prefill_question = q
-
+            st.session_state.prefill = q
     st.divider()
-    st.caption("Built by [Your Name] | AIML Student Project")
+    st.caption("Built by [Your Name] · AIML Student Project")
     st.caption("Data: PubMed via NCBI Entrez API")
 
 # ============================================================
-# MAIN HEADER
+# HEADER
 # ============================================================
 st.markdown("""
 <div class="main-header">
-    <h2 style="margin:0">🩺 MedQuery AI</h2>
-    <p style="margin:4px 0 0; opacity:0.85; font-size:14px">
-        Evidence-based clinical Q&A powered by PubMed literature, BioBERT & LLaMA-3
-    </p>
+  <h2 style="margin:0">🩺 MedQuery AI</h2>
+  <p style="margin:4px 0 0;opacity:.85;font-size:14px">
+    Evidence-based clinical Q&A · PubMed · BioBERT · LLaMA-3
+  </p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -126,99 +236,67 @@ st.markdown("""
 # ============================================================
 if "messages" not in st.session_state:
     st.session_state.messages = []
-    st.session_state.results = []
+    st.session_state.results  = []
 
-# Display past messages
-for i, message in enumerate(st.session_state.messages):
-    with st.chat_message(message["role"]):
-        if message["role"] == "assistant" and i // 2 < len(st.session_state.results):
-            result = st.session_state.results[i // 2]
-
-            # Confidence badge
-            conf = result["confidence"]
-            conf_class = f"confidence-{conf.lower()}"
-            col1, col2, col3 = st.columns([2, 2, 3])
-            with col1:
-                st.markdown(f'<span class="{conf_class}">● {conf} confidence</span>', unsafe_allow_html=True)
-            with col2:
-                st.markdown(f'<span style="font-size:13px; color:#666">📊 {result["avg_relevancy"]}% avg relevancy</span>', unsafe_allow_html=True)
-            with col3:
-                st.markdown(f'<span style="font-size:13px; color:#666">📄 {result["chunks_retrieved"]} chunks retrieved</span>', unsafe_allow_html=True)
-
-            st.markdown(message["content"])
-
-            # Sources
-            with st.expander(f"📚 View {len(result['sources'])} sources"):
-                for src in result["sources"]:
-                    st.markdown(f"""
-                    <div class="source-card">
-                        <b>PMID: {src['pubmed_id']}</b> &nbsp;|&nbsp; {src['year']} &nbsp;|&nbsp; 
-                        Relevancy: <b>{src['relevancy_score']}%</b><br>
-                        <i>{src['title'][:100]}{'...' if len(src['title']) > 100 else ''}</i><br>
-                        <small>{src['authors']}</small><br>
-                        <a href="{src['source_url']}" target="_blank">🔗 View on PubMed</a>
-                    </div>
-                    """, unsafe_allow_html=True)
-
-            st.markdown('<div class="disclaimer">⚠️ <b>Disclaimer:</b> For informational/research purposes only. Not a substitute for professional medical advice, diagnosis, or treatment.</div>', unsafe_allow_html=True)
+for i, msg in enumerate(st.session_state.messages):
+    with st.chat_message(msg["role"]):
+        if msg["role"] == "assistant":
+            res = st.session_state.results[i // 2]
+            c   = res["confidence"]
+            c1, c2, c3 = st.columns([2, 2, 3])
+            c1.markdown(f'<span class="confidence-{c.lower()}">● {c}</span>', unsafe_allow_html=True)
+            c2.markdown(f'<small>📊 {res["avg_relevancy"]}% relevancy</small>', unsafe_allow_html=True)
+            c3.markdown(f'<small>📄 {res["chunks_retrieved"]} chunks</small>', unsafe_allow_html=True)
+            st.markdown(msg["content"])
+            with st.expander(f"📚 {len(res['sources'])} sources"):
+                for s in res["sources"]:
+                    st.markdown(
+                        f'<div class="source-card"><b>PMID {s["pubmed_id"]}</b> | '
+                        f'{s["year"]} | <b>{s["relevancy_score"]}%</b><br>'
+                        f'<i>{s["title"][:90]}...</i><br>'
+                        f'<small>{s["authors"]}</small><br>'
+                        f'<a href="{s["source_url"]}" target="_blank">🔗 PubMed</a></div>',
+                        unsafe_allow_html=True
+                    )
+            st.markdown('<div class="disclaimer">⚠️ For informational purposes only. Not medical advice.</div>', unsafe_allow_html=True)
         else:
-            st.markdown(message["content"])
+            st.markdown(msg["content"])
 
 # ============================================================
 # CHAT INPUT
 # ============================================================
-prefill = st.session_state.pop("prefill_question", None)
-question = st.chat_input("Ask a clinical question (e.g. 'What are the side effects of metformin?')")
-
+prefill  = st.session_state.pop("prefill", None)
+question = st.chat_input("Ask a clinical question...")
 if prefill:
     question = prefill
 
 if question:
-    # Show user message
     st.session_state.messages.append({"role": "user", "content": question})
     with st.chat_message("user"):
         st.markdown(question)
 
-    # Generate answer
     with st.chat_message("assistant"):
+        model, collection, llm = load_pipeline()
         with st.spinner("🔍 Searching PubMed literature..."):
-            rag = load_rag()
-            result = rag.query(question)
+            res = run_query(question, model, collection, llm)
 
-        # Metrics
-        conf = result["confidence"]
-        conf_class = f"confidence-{conf.lower()}"
-        col1, col2, col3 = st.columns([2, 2, 3])
-        with col1:
-            st.markdown(f'<span class="{conf_class}">● {conf} confidence</span>', unsafe_allow_html=True)
-        with col2:
-            st.markdown(f'<span style="font-size:13px; color:#666">📊 {result["avg_relevancy"]}% avg relevancy</span>', unsafe_allow_html=True)
-        with col3:
-            st.markdown(f'<span style="font-size:13px; color:#666">📄 {result["chunks_retrieved"]} chunks retrieved</span>', unsafe_allow_html=True)
+        c = res["confidence"]
+        c1, c2, c3 = st.columns([2, 2, 3])
+        c1.markdown(f'<span class="confidence-{c.lower()}">● {c}</span>', unsafe_allow_html=True)
+        c2.markdown(f'<small>📊 {res["avg_relevancy"]}% relevancy</small>', unsafe_allow_html=True)
+        c3.markdown(f'<small>📄 {res["chunks_retrieved"]} chunks</small>', unsafe_allow_html=True)
+        st.markdown(res["answer"])
+        with st.expander(f"📚 {len(res['sources'])} sources"):
+            for s in res["sources"]:
+                st.markdown(
+                    f'<div class="source-card"><b>PMID {s["pubmed_id"]}</b> | '
+                    f'{s["year"]} | <b>{s["relevancy_score"]}%</b><br>'
+                    f'<i>{s["title"][:90]}...</i><br>'
+                    f'<small>{s["authors"]}</small><br>'
+                    f'<a href="{s["source_url"]}" target="_blank">🔗 PubMed</a></div>',
+                    unsafe_allow_html=True
+                )
+        st.markdown('<div class="disclaimer">⚠️ For informational purposes only. Not medical advice.</div>', unsafe_allow_html=True)
 
-        # Stream answer
-        st.markdown(result["answer"])
-
-        # Sources expander
-        with st.expander(f"📚 View {len(result['sources'])} sources"):
-            for src in result["sources"]:
-                st.markdown(f"""
-                <div class="source-card">
-                    <b>PMID: {src['pubmed_id']}</b> &nbsp;|&nbsp; {src['year']} &nbsp;|&nbsp; 
-                    Relevancy: <b>{src['relevancy_score']}%</b><br>
-                    <i>{src['title'][:100]}{'...' if len(src['title']) > 100 else ''}</i><br>
-                    <small>{src['authors']}</small><br>
-                    <a href="{src['source_url']}" target="_blank">🔗 View on PubMed</a>
-                </div>
-                """, unsafe_allow_html=True)
-
-        if show_raw_chunks:
-            with st.expander("🔬 Raw retrieved chunks (debug view)"):
-                for i, src in enumerate(result["sources"]):
-                    st.markdown(f"**Chunk {i+1}** (PMID {src['pubmed_id']})")
-
-        st.markdown('<div class="disclaimer">⚠️ <b>Disclaimer:</b> For informational/research purposes only. Not a substitute for professional medical advice, diagnosis, or treatment.</div>', unsafe_allow_html=True)
-
-    # Save to history
-    st.session_state.messages.append({"role": "assistant", "content": result["answer"]})
-    st.session_state.results.append(result)
+    st.session_state.messages.append({"role": "assistant", "content": res["answer"]})
+    st.session_state.results.append(res)
