@@ -94,59 +94,87 @@ def get_groq_key():
 def load_pipeline():
     groq_key = get_groq_key()
 
-    # 1. Load BioBERT
-    with st.spinner("🧬 Loading BioBERT embeddings..."):
+    # 1. Load BioBERT (only for query embedding — NOT for ingestion)
+    with st.spinner("🧬 Loading BioBERT model..."):
         model = SentenceTransformer(EMBEDDING_MODEL)
 
-    # 2. Build ChromaDB from pubmed_raw.json
-    with st.spinner("🗄️ Building vector store from PubMed data..."):
+    # 2. Load ChromaDB — fast path if cache exists, slow path if not
+    with st.spinner("🗄️ Loading vector store..."):
         client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
         try:
             client.delete_collection(COLLECTION_NAME)
         except Exception:
             pass
-
         collection = client.create_collection(
             name=COLLECTION_NAME,
             metadata={"hnsw:space": "cosine"}
         )
 
-        with open("pubmed_raw.json", "r") as f:
-            articles = json.load(f)
+        import os, numpy as np
 
-        def chunk_text(text, size=400, overlap=50):
-            words = text.split()
-            chunks, step = [], size - overlap
-            for i in range(0, len(words), step):
-                chunk = " ".join(words[i:i + size])
-                if len(chunk.split()) >= 50:
-                    chunks.append(chunk)
-            return chunks
+        if os.path.exists("embeddings_cache.npz"):
+            # ⚡ FAST PATH: load pre-computed embeddings (~15 sec)
+            cache      = np.load("embeddings_cache.npz", allow_pickle=True)
+            documents  = cache["documents"].tolist()
+            embeddings = cache["embeddings"]
+            metadatas  = [
+                {
+                    "pubmed_id":  str(cache["pubmed_ids"][i]),
+                    "title":      str(cache["titles"][i]),
+                    "authors":    str(cache["authors"][i]),
+                    "year":       str(cache["years"][i]),
+                    "source_url": str(cache["urls"][i]),
+                }
+                for i in range(len(documents))
+            ]
+            ids = [f"chunk_{i}" for i in range(len(documents))]
 
-        documents, metadatas, ids = [], [], []
-        for article in articles:
-            full_text = f"Title: {article['title']}\n\nAbstract: {article['abstract']}"
-            for idx, chunk in enumerate(chunk_text(full_text)):
-                documents.append(chunk)
-                metadatas.append({
-                    "pubmed_id":  article["pubmed_id"],
-                    "title":      article["title"],
-                    "authors":    article["authors"],
-                    "year":       article["year"],
-                    "source_url": article["source_url"],
-                })
-                ids.append(f"pmid_{article['pubmed_id']}_chunk_{idx}")
+            # Add in batches
+            batch_size = 500
+            for i in range(0, len(documents), batch_size):
+                collection.add(
+                    documents  = documents[i:i+batch_size],
+                    embeddings = embeddings[i:i+batch_size].tolist(),
+                    metadatas  = metadatas[i:i+batch_size],
+                    ids        = ids[i:i+batch_size]
+                )
+        else:
+            # 🐢 SLOW PATH: recompute from pubmed_raw.json (fallback)
+            with open("pubmed_raw.json", "r") as f:
+                articles = json.load(f)
 
-        # Embed in batches of 64
-        for i in range(0, len(documents), 64):
-            batch      = documents[i:i+64]
-            embeddings = model.encode(batch, normalize_embeddings=True).tolist()
-            collection.add(
-                documents  = batch,
-                embeddings = embeddings,
-                metadatas  = metadatas[i:i+64],
-                ids        = ids[i:i+64]
-            )
+            def chunk_text(text, size=400, overlap=50):
+                words = text.split()
+                chunks, step = [], size - overlap
+                for i in range(0, len(words), step):
+                    chunk = " ".join(words[i:i + size])
+                    if len(chunk.split()) >= 50:
+                        chunks.append(chunk)
+                return chunks
+
+            documents, metadatas, ids = [], [], []
+            for article in articles:
+                full_text = f"Title: {article['title']}\n\nAbstract: {article['abstract']}"
+                for idx, chunk in enumerate(chunk_text(full_text)):
+                    documents.append(chunk)
+                    metadatas.append({
+                        "pubmed_id":  article["pubmed_id"],
+                        "title":      article["title"],
+                        "authors":    article["authors"],
+                        "year":       article["year"],
+                        "source_url": article["source_url"],
+                    })
+                    ids.append(f"pmid_{article['pubmed_id']}_chunk_{idx}")
+
+            for i in range(0, len(documents), 64):
+                batch      = documents[i:i+64]
+                embeddings = model.encode(batch, normalize_embeddings=True).tolist()
+                collection.add(
+                    documents  = batch,
+                    embeddings = embeddings,
+                    metadatas  = metadatas[i:i+64],
+                    ids        = ids[i:i+64]
+                )
 
     # 3. Groq LLM
     llm = Groq(api_key=groq_key)
