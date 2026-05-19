@@ -2,6 +2,10 @@
 
 > A domain-specific Retrieval-Augmented Generation (RAG) system that answers clinical questions from 10,000+ PubMed abstracts using BioBERT embeddings, ChromaDB, and LLaMA-3.
 
+## Live Demo
+
+🚀 [Try the Medical RAG Assistant](https://medical-rag-assistant-vaishu.streamlit.app/)
+
 [![Python](https://img.shields.io/badge/Python-3.10+-blue)](https://python.org)
 [![Streamlit](https://img.shields.io/badge/Streamlit-1.36-red)](https://streamlit.io)
 [![ChromaDB](https://img.shields.io/badge/ChromaDB-0.5-green)](https://trychroma.com)
